@@ -50,9 +50,9 @@ It started out of boredom and curiosity — not fully sure what it's becoming ye
 
 ## 🛠️ Features (Current & Planned)
 
-* [ ] TCP Proxy with connection relay
-* [ ] SOCKS4/SOCKS5 support
-* [ ] HTTP/HTTPS support
+* [x] TCP Proxy with connection relay
+* [x] SOCKS4/SOCKS5 support
+* [x] HTTP/HTTPS support
 * [ ] Shared state management with async locking
 * [ ] Web interface (via HTTP + WebSockets) to control connections
 * [ ] Redis-backed shared state for clustering / persistence

@@ -13,13 +13,65 @@ pub enum ConnectionState {
     Closed,
 }
 
+// ConnectionType enum
+#[derive(Debug)]
+pub enum ConnectionType {
+    /// Forward proxy (client -> proxy -> target server)
+    Forward {
+        target: ProxyTarget,
+        protocol: ProxyProtocol,
+    },
+    /// Reverse tunnel (client requests proxy to expose a local service)
+    ReverseTunnel {
+        service_type: ServiceType,
+        listen_port: Option<u16>, // None = auto-assign port
+    },
+}
+
+// Supported protocols
+#[derive(Debug)]
+pub enum ProxyProtocol {
+    Http,
+    Https,
+    Socks5,
+    Tcp, // Raw TCP
+    Ssh,
+    Custom(String),
+}
+
+// Service types for reverse tunnels
+#[derive(Debug)]
+pub enum ServiceType {
+    Database(DbType),
+    WebService,
+    SshService,
+    Custom(String),
+}
+
+#[derive(Debug)]
+pub enum DbType {
+    Postgres,
+    MySQL,
+    Redis,
+    MongoDB,
+    Custom(String),
+}
+
 #[derive(Debug)]
 pub struct ConnectionRequest {
     pub id: Uuid,
     pub client_addr: SocketAddr,
-    pub target: ProxyTarget,
+    pub connection_type: ConnectionType,
     pub state: ConnectionState,
-    pub decision_tx: Option<oneshot::Sender<bool>>,
+    pub decision_tx: Option<oneshot::Sender<ConnectionApproval>>,
+}
+
+// Expanded approval response
+#[derive(Debug)]
+pub enum ConnectionApproval {
+    Approved,
+    ApprovedWithPort(u16), // For reverse tunnels
+    Rejected(String),      // Rejection reason
 }
 
 #[derive(Debug)]
@@ -37,13 +89,13 @@ pub enum ConnectionError {
 impl ConnectionRequest {
     pub fn new(
         client_addr: SocketAddr,
-        target: ProxyTarget,
-        decision_tx: Option<oneshot::Sender<bool>>,
+        connection_type: ConnectionType,
+        decision_tx: Option<oneshot::Sender<ConnectionApproval>>,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
             client_addr,
-            target,
+            connection_type,
             decision_tx,
             state: ConnectionState::Pending,
         }
@@ -72,13 +124,17 @@ impl ConnectionManager {
         request.state = ConnectionState::Approved;
 
         if let Some(tx) = request.decision_tx.take() {
-            let _ = tx.send(true); // Ignore send errors
+            let _ = tx.send(ConnectionApproval::Approved); // Ignore send errors
         }
 
         Ok(())
     }
 
-    pub fn reject_connection(&mut self, id: Uuid) -> Result<(), ConnectionError> {
+    pub fn reject_connection(
+        &mut self,
+        id: Uuid,
+        rejection_reason: String,
+    ) -> Result<(), ConnectionError> {
         let mut request = self.pending.remove(&id).ok_or(ConnectionError::NotFound)?;
 
         if !matches!(request.state, ConnectionState::Pending) {
@@ -88,7 +144,7 @@ impl ConnectionManager {
         request.state = ConnectionState::Rejected;
 
         if let Some(tx) = request.decision_tx.take() {
-            let _ = tx.send(false);
+            let _ = tx.send(ConnectionApproval::Rejected(rejection_reason));
         }
 
         // Optionally drop or store rejected connections

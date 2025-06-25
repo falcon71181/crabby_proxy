@@ -1,9 +1,12 @@
 use crate::app_state::AppState;
 use crate::proxy::protocol::ProxyProtocol;
+use crate::stream::TunnelStream;
 use crate::utils;
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    self, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
@@ -122,14 +125,20 @@ async fn async_handle_client(
     }
     .map_err(|e| (e, ErrorType::Response))?;
 
-    let (mut client_read, mut client_write) = io::split(client_stream);
-    let (mut target_read, mut target_write) = io::split(target_stream);
+    let (client_read, client_write) = io::split(client_stream);
+    let (target_read, target_write) = io::split(target_stream);
+
+    // Create bidirectional tunnel streams
+    let client_to_target_stream = TunnelStream::new(client_read, target_write);
+    let target_to_client_stream = TunnelStream::new(target_read, client_write);
 
     let label_c2t = format!("[{}]: C[{}]->T[{}]", protocol, client_addr, target_addr);
     let label_t2c = format!("[{}]: T[{}]->C[{}]", protocol, target_addr, client_addr);
 
-    let client_to_target = relay_with_logging(&mut client_read, &mut target_write, &label_c2t);
-    let target_to_client = relay_with_logging(&mut target_read, &mut client_write, &label_t2c);
+    let client_to_target =
+        TunnelStream::relay_with_tunnel_stream(client_to_target_stream, &label_c2t);
+    let target_to_client =
+        TunnelStream::relay_with_tunnel_stream(target_to_client_stream, &label_t2c);
 
     // Run bidirectional relay
     match tokio::try_join!(client_to_target, target_to_client) {
@@ -150,33 +159,33 @@ async fn async_handle_client(
     }
 }
 
-/// Relay data from `reader` to `writer`,
+/// Relay data using TunnelStream
 ///
-/// `label` is a tag for the direction, e.g., "C->T" (client to target).
-async fn relay_with_logging<R, W>(
-    mut reader: R,
-    mut writer: W,
+/// label is a tag for the direction, e.g., "C->T" (client to target).
+async fn relay_with_tunnel_stream<R, W>(
+    mut tunnel: TunnelStream<R, W>,
     label: &str,
 ) -> tokio::io::Result<u64>
 where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; 1024];
     let mut total = 0;
 
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = tunnel.read(&mut buf).await?;
         if n == 0 {
             break;
         }
 
         tracing::debug!("{}", label);
 
-        writer.write_all(&buf[..n]).await?;
+        tunnel.write_all(&buf[..n]).await?;
         total += n as u64;
     }
 
+    tunnel.shutdown().await?;
     Ok(total)
 }
 

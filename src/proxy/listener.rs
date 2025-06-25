@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use crate::proxy::protocol::ProxyProtocol;
-use crate::stream::TunnelStream;
+use crate::stream::{create_bidirectional_tunnel, TunnelStream};
 use crate::utils;
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -125,23 +125,13 @@ async fn async_handle_client(
     }
     .map_err(|e| (e, ErrorType::Response))?;
 
-    let (client_read, client_write) = io::split(client_stream);
-    let (target_read, target_write) = io::split(target_stream);
-
-    // Create bidirectional tunnel streams
-    let client_to_target_stream = TunnelStream::new(client_read, target_write);
-    let target_to_client_stream = TunnelStream::new(target_read, client_write);
+    let client_halves = io::split(client_stream);
+    let target_halves = io::split(target_stream);
 
     let label_c2t = format!("[{}]: C[{}]->T[{}]", protocol, client_addr, target_addr);
     let label_t2c = format!("[{}]: T[{}]->C[{}]", protocol, target_addr, client_addr);
 
-    let client_to_target =
-        TunnelStream::relay_with_tunnel_stream(client_to_target_stream, &label_c2t);
-    let target_to_client =
-        TunnelStream::relay_with_tunnel_stream(target_to_client_stream, &label_t2c);
-
-    // Run bidirectional relay
-    match tokio::try_join!(client_to_target, target_to_client) {
+    match create_bidirectional_tunnel(client_halves, target_halves, &label_c2t, &label_t2c).await {
         Ok((c2t, t2c)) => {
             tracing::info!(
                 "Closed tunnel {} <-> {} (sent: {}, received: {})",

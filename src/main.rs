@@ -4,6 +4,7 @@ mod connection;
 mod error;
 mod proxy;
 mod stream;
+mod tunnel;
 mod utils;
 use crate::app_state::AppState;
 use crate::proxy::listener::run_proxy_server;

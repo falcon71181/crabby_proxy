@@ -40,7 +40,7 @@ pub enum ProxyProtocol {
 }
 
 // Service types for reverse tunnels
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServiceType {
     Database(DbType),
     WebService,
@@ -48,7 +48,7 @@ pub enum ServiceType {
     Custom(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DbType {
     Postgres,
     MySQL,

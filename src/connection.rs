@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, time::Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::proxy::protocol::ProxyTarget;
+use crate::proxy::protocol::{ProxyProtocol, ProxyTarget};
 
 #[derive(Debug)]
 pub enum ConnectionState {
@@ -26,17 +26,6 @@ pub enum ConnectionType {
         service_type: ServiceType,
         listen_port: Option<u16>, // None = auto-assign port
     },
-}
-
-// Supported protocols
-#[derive(Debug)]
-pub enum ProxyProtocol {
-    Http,
-    Https,
-    Socks5,
-    Tcp, // Raw TCP
-    Ssh,
-    Custom(String),
 }
 
 // Service types for reverse tunnels

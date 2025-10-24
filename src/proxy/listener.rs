@@ -2,6 +2,7 @@ use crate::app_state::AppState;
 use crate::proxy::protocol::ProxyProtocol;
 use crate::stream::{create_bidirectional_tunnel, TunnelStream};
 use crate::utils;
+use base64::Engine;
 use std::net::SocketAddr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{
@@ -12,6 +13,8 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
 use super::protocol::ProxyTarget;
+
+type AuthResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 // Error classification
 #[derive(Debug, PartialEq)]
@@ -57,8 +60,106 @@ async fn send_error_response(
     }
 }
 
+fn validate_auth_header(
+    auth_header: &str,
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if auth_header.starts_with("Basic ") {
+        let encoded = &auth_header[6..]; // Skip "Basic " bytes
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "Invalid base64 encoding")?;
+
+        let credentials = String::from_utf8(decoded).map_err(|_| "Invalid UTF-8 in credentials")?;
+
+        let mut parts = credentials.splitn(2, ':');
+        let username = parts.next().ok_or("Missing username")?;
+        let password = parts.next().ok_or("Missing password")?;
+
+        if validate_credentials(username, password, state) {
+            Ok(())
+        } else {
+            Err("Invalid credentials".into())
+        }
+    } else {
+        Err("Unsupported authentication method".into())
+    }
+}
+
+fn validate_credentials(username: &str, password: &str, state: &AppState) -> bool {
+    let (expected_username, expected_password) = match (&state.username, &state.password) {
+        (Some(user), Some(pass)) => (user, pass),
+        _ => return false,
+    };
+
+    let username_ok = bool::from(expected_username.as_bytes().eq(username.as_bytes()));
+    let password_ok = bool::from(expected_password.as_bytes().eq(password.as_bytes()));
+
+    username_ok && password_ok
+}
+
+async fn send_auth_error_response(
+    client_stream: &mut TcpStream,
+    protocol: &ProxyProtocol,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match protocol {
+        ProxyProtocol::HTTP => send_http_auth_required_response(client_stream).await,
+        ProxyProtocol::SOCKS5 => {
+            // Already handled in authenticate_socks5
+            Ok(())
+        }
+        ProxyProtocol::SOCKS4 => {
+            // Already handled in authenticate_socks4
+            Ok(())
+        }
+        _ => {
+            // For other protocols, send a simple message
+            client_stream
+                .write_all(b"Authentication required\n")
+                .await?;
+            Ok(())
+        }
+    }
+}
+
 async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, state: AppState) {
     let mut protocol = ProxyProtocol::TCP;
+
+    // First detect the protocol
+    let protocol_detection_result = detect_client_protocol(&mut client_stream, &mut protocol).await;
+
+    if let Err(e) = protocol_detection_result {
+        tracing::error!("Protocol detection failed for {}: {}", client_addr, e);
+        return;
+    }
+
+    // If credentials are required, perform protocol-specific authentication
+    if state.require_creds {
+        match authenticate_by_protocol(&mut client_stream, &protocol, &state).await {
+            Ok(true) => {
+                tracing::debug!(
+                    "{} authenticated successfully via {}",
+                    client_addr,
+                    protocol
+                );
+            }
+            Ok(false) => {
+                // Authentication not required for this protocol or no auth method
+                tracing::debug!(
+                    "No authentication required for {} via {}",
+                    client_addr,
+                    protocol
+                );
+            }
+            Err(e) => {
+                tracing::error!("Auth failed for {} via {}: {}", client_addr, protocol, e);
+                let _ = send_auth_error_response(&mut client_stream, &protocol).await;
+                return;
+            }
+        }
+    } else {
+        tracing::debug!("Skipping authentication (--no-creds)");
+    }
 
     let result = async_handle_client(&mut client_stream, client_addr, &mut protocol).await;
 
@@ -79,6 +180,212 @@ async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, st
         if error_type != ErrorType::Tunnel {
             let _ = send_error_response(&protocol, &mut client_stream, error_type).await;
         }
+    }
+}
+
+async fn detect_client_protocol(
+    client_stream: &mut TcpStream,
+    protocol: &mut ProxyProtocol,
+) -> Result<(), io::Error> {
+    let mut peek_buf = [0u8; 4];
+
+    match timeout(Duration::from_secs(5), client_stream.peek(&mut peek_buf)).await {
+        Ok(Ok(_)) => {
+            *protocol = detect_protocol(&peek_buf)
+                .await
+                .unwrap_or(ProxyProtocol::TCP);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            *protocol = ProxyProtocol::TCP;
+            Ok(())
+        }
+    }
+}
+
+async fn authenticate_by_protocol(
+    client_stream: &mut TcpStream,
+    protocol: &ProxyProtocol,
+    state: &AppState,
+) -> AuthResult<bool> {
+    match protocol {
+        ProxyProtocol::HTTP => authenticate_http(client_stream, state).await,
+        ProxyProtocol::SOCKS5 => authenticate_socks5(client_stream, state).await,
+        ProxyProtocol::SOCKS4 => authenticate_socks4(client_stream, state).await,
+        _ => {
+            // For TCP and other protocols that don't support authentication
+            // We can either reject them or allow without auth
+            tracing::warn!(
+                "Protocol {} doesn't support authentication, allowing connection",
+                protocol
+            );
+            Ok(false)
+        }
+    }
+}
+
+async fn authenticate_http(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+    let mut buffer = [0u8; 4096];
+    let n = client_stream.peek(&mut buffer).await?;
+
+    if n == 0 {
+        return Err("Connection closed by client".into());
+    }
+
+    let request_data = String::from_utf8_lossy(&buffer[..n]);
+
+    // Extract Proxy-Authorization header from HTTP request
+    if let Some(auth_header) = extract_proxy_auth_header(&request_data) {
+        if validate_auth_header(auth_header, state).is_ok() {
+            return Ok(true);
+        }
+    }
+
+    // Authentication failed - send 407 response
+    let _ = send_http_auth_required_response(client_stream).await;
+    Err("HTTP authentication required".into())
+}
+
+fn extract_proxy_auth_header(request_data: &str) -> Option<&str> {
+    for line in request_data.lines() {
+        if line.to_lowercase().starts_with("proxy-authorization:") {
+            return Some(line.trim_start_matches("Proxy-Authorization:").trim());
+        }
+    }
+    None
+}
+
+async fn send_http_auth_required_response(
+    client_stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                   Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\
+                   Content-Length: 0\r\n\
+                   Connection: close\r\n\
+                   \r\n";
+
+    client_stream.write_all(response.as_bytes()).await?;
+    client_stream.flush().await?;
+    Ok(())
+}
+
+async fn authenticate_socks4(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+    // Read SOCKS4 request
+    let mut request_buf = [0u8; 8];
+    client_stream.read_exact(&mut request_buf).await?;
+
+    let version = request_buf[0];
+    let _command = request_buf[1];
+
+    if version != 0x04 {
+        return Err("Invalid SOCKS4 version".into());
+    }
+
+    // SOCKS4 doesn't have proper authentication, but we can check the user ID field
+    if state.require_creds {
+        // Read user ID (null-terminated string)
+        let mut user_id = Vec::new();
+        let mut byte_buf = [0u8; 1];
+
+        loop {
+            client_stream.read_exact(&mut byte_buf).await?;
+            if byte_buf[0] == 0 {
+                break;
+            }
+            user_id.push(byte_buf[0]);
+        }
+
+        let user_id_str = String::from_utf8(user_id).unwrap_or_default();
+
+        // For SOCKS4, we might implement a simple token-based auth using the user ID field
+        // This is non-standard but commonly used as a workaround
+        if validate_socks4_user_id(&user_id_str, state) {
+            Ok(true)
+        } else {
+            // Send SOCKS4 rejection
+            let mut response = vec![0x00, 0x5B]; // 0x00 (version), 0x5B (rejected)
+            response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NULL address
+            response.extend_from_slice(&[0x00, 0x00]); // NULL port
+            client_stream.write_all(&response).await?;
+            Err("SOCKS4 authentication failed".into())
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+fn validate_socks4_user_id(user_id: &str, state: &AppState) -> bool {
+    // Simple implementation: check if user_id matches expected username
+    // You might want to implement a more sophisticated scheme
+    if let Some(expected_username) = &state.username {
+        bool::from(expected_username.as_bytes().eq(user_id.as_bytes()))
+    } else {
+        false
+    }
+}
+
+async fn authenticate_socks5(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+    // Read SOCKS5 handshake
+    let mut handshake_buf = [0u8; 2];
+    client_stream.read_exact(&mut handshake_buf).await?;
+
+    let version = handshake_buf[0];
+    let num_methods = handshake_buf[1];
+
+    if version != 0x05 {
+        return Err("Invalid SOCKS version".into());
+    }
+
+    let mut methods_buf = vec![0u8; num_methods as usize];
+    client_stream.read_exact(&mut methods_buf).await?;
+
+    // Check if username/password auth is supported by client
+    let supports_auth = methods_buf.contains(&0x02);
+
+    if state.require_creds && supports_auth {
+        // Tell client to use username/password auth
+        client_stream.write_all(&[0x05, 0x02]).await?;
+
+        // Read auth request
+        let mut auth_buf = [0u8; 2];
+        client_stream.read_exact(&mut auth_buf).await?;
+
+        let auth_version = auth_buf[0];
+        if auth_version != 0x01 {
+            return Err("Unsupported SOCKS5 auth version".into());
+        }
+
+        let username_len = auth_buf[1] as usize;
+        let mut username_buf = vec![0u8; username_len];
+        client_stream.read_exact(&mut username_buf).await?;
+
+        let mut pass_len_buf = [0u8; 1];
+        client_stream.read_exact(&mut pass_len_buf).await?;
+        let password_len = pass_len_buf[0] as usize;
+
+        let mut password_buf = vec![0u8; password_len];
+        client_stream.read_exact(&mut password_buf).await?;
+
+        let username = String::from_utf8(username_buf)?;
+        let password = String::from_utf8(password_buf)?;
+
+        // Validate credentials
+        if validate_credentials(&username, &password, state) {
+            client_stream.write_all(&[0x01, 0x00]).await?; // Success
+            Ok(true)
+        } else {
+            client_stream.write_all(&[0x01, 0x01]).await?; // Failure
+            Err("SOCKS5 authentication failed".into())
+        }
+    } else if state.require_creds {
+        // Client doesn't support auth but we require it
+        client_stream.write_all(&[0x05, 0xFF]).await?; // No acceptable methods
+        Err("SOCKS5 authentication required but not supported by client".into())
+    } else {
+        // No auth required
+        client_stream.write_all(&[0x05, 0x00]).await?; // No authentication
+        Ok(false)
     }
 }
 

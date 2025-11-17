@@ -45,7 +45,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let state = AppState::new(notify_tx, require_creds, username, password);
+    let state = AppState::new(notify_tx, require_creds, username, password, None);
 
     let proxy_handle = tokio::spawn(run_proxy_server(
         state.clone(),

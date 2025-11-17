@@ -4,7 +4,61 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+};
+
+pub enum ClientStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+impl AsyncRead for ClientStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ClientStream::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            ClientStream::Tls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ClientStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            ClientStream::Tls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            ClientStream::Tls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match &mut *self {
+            ClientStream::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            ClientStream::Tls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
 
 pub struct TunnelStream<R: AsyncRead, W: AsyncWrite> {
     read: R,
@@ -31,7 +85,7 @@ impl<R: AsyncRead, W: AsyncWrite> TunnelStream<R, W> {
                 break;
             }
 
-            tracing::debug!("{} - {} bytes", label, n);
+            tracing::trace!("{} - {} bytes", label, n);
 
             self.write.write_all(&buf[..n]).await?;
             total += n as u64;

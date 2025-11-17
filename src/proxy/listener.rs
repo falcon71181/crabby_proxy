@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use crate::proxy::protocol::ProxyProtocol;
-use crate::stream::{create_bidirectional_tunnel, TunnelStream};
+use crate::stream::{create_bidirectional_tunnel, ClientStream, TunnelStream};
 use crate::utils;
 use base64::Engine;
 use std::net::SocketAddr;
@@ -39,7 +39,7 @@ pub async fn run_proxy_server(state: AppState, addr: SocketAddr) {
 // Helper function to send error responses
 async fn send_error_response(
     protocol: &ProxyProtocol,
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     error_type: ErrorType,
 ) -> io::Result<()> {
     match (protocol, error_type) {
@@ -98,30 +98,6 @@ fn validate_credentials(username: &str, password: &str, state: &AppState) -> boo
     username_ok && password_ok
 }
 
-async fn send_auth_error_response(
-    client_stream: &mut TcpStream,
-    protocol: &ProxyProtocol,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match protocol {
-        ProxyProtocol::HTTP => send_http_auth_required_response(client_stream).await,
-        ProxyProtocol::SOCKS5 => {
-            // Already handled in authenticate_socks5
-            Ok(())
-        }
-        ProxyProtocol::SOCKS4 => {
-            // Already handled in authenticate_socks4
-            Ok(())
-        }
-        _ => {
-            // For other protocols, send a simple message
-            client_stream
-                .write_all(b"Authentication required\n")
-                .await?;
-            Ok(())
-        }
-    }
-}
-
 async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, state: AppState) {
     let mut protocol = ProxyProtocol::TCP;
 
@@ -133,27 +109,52 @@ async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, st
         return;
     }
 
+    // If protocol is HTTPS and we have TLS support, upgrade the connection
+    let mut stream: ClientStream = if protocol == ProxyProtocol::HTTPS {
+        match &state.tls_acceptor {
+            Some(tls_acceptor) => match tls_acceptor.accept(client_stream).await {
+                Ok(tls_stream) => {
+                    tracing::debug!("TLS handshake successful for {}", client_addr);
+                    ClientStream::Tls(tls_stream)
+                }
+                Err(e) => {
+                    tracing::error!("TLS handshake failed for {}: {}", client_addr, e);
+                    return;
+                }
+            },
+            None => {
+                tracing::error!(
+                    "HTTPS protocol detected but no TLS configuration available for {}",
+                    client_addr
+                );
+                return;
+            }
+        }
+    } else {
+        ClientStream::Plain(client_stream)
+    };
+
     // If credentials are required, perform protocol-specific authentication
     if state.require_creds {
-        match authenticate_by_protocol(&mut client_stream, &protocol, &state).await {
+        match authenticate_by_protocol(&mut stream, &protocol, &state).await {
             Ok(true) => {
                 tracing::debug!(
                     "{} authenticated successfully via {}",
-                    client_addr,
+                    &client_addr,
                     protocol
                 );
             }
             Ok(false) => {
-                // Authentication not required for this protocol or no auth method
-                tracing::debug!(
-                    "No authentication required for {} via {}",
-                    client_addr,
+                // Authentication required for this protocol
+                tracing::error!(
+                    "Authentication required for {} via {}",
+                    &client_addr,
                     protocol
                 );
+                return;
             }
             Err(e) => {
                 tracing::error!("Auth failed for {} via {}: {}", client_addr, protocol, e);
-                let _ = send_auth_error_response(&mut client_stream, &protocol).await;
                 return;
             }
         }
@@ -161,7 +162,7 @@ async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, st
         tracing::debug!("Skipping authentication (--no-creds)");
     }
 
-    let result = async_handle_client(&mut client_stream, client_addr, &mut protocol).await;
+    let result = async_handle_client(&mut stream, client_addr, &mut protocol).await;
 
     if let Err((e, error_type)) = result {
         tracing::error!(
@@ -178,7 +179,7 @@ async fn handle_client(mut client_stream: TcpStream, client_addr: SocketAddr, st
         );
 
         if error_type != ErrorType::Tunnel {
-            let _ = send_error_response(&protocol, &mut client_stream, error_type).await;
+            let _ = send_error_response(&protocol, &mut stream, error_type).await;
         }
     }
 }
@@ -205,19 +206,21 @@ async fn detect_client_protocol(
 }
 
 async fn authenticate_by_protocol(
-    client_stream: &mut TcpStream,
+    client_stream: &mut ClientStream,
     protocol: &ProxyProtocol,
     state: &AppState,
 ) -> AuthResult<bool> {
     match protocol {
-        ProxyProtocol::HTTP => authenticate_http(client_stream, state).await,
+        ProxyProtocol::HTTP | ProxyProtocol::HTTPS => {
+            authenticate_http_or_https(client_stream, state).await
+        }
         ProxyProtocol::SOCKS5 => authenticate_socks5(client_stream, state).await,
         ProxyProtocol::SOCKS4 => authenticate_socks4(client_stream, state).await,
         _ => {
             // For TCP and other protocols that don't support authentication
-            // We can either reject them or allow without auth
+            // We can reject them without auth
             tracing::warn!(
-                "Protocol {} doesn't support authentication, allowing connection",
+                "Protocol {} doesn't support authentication, rejecting connection",
                 protocol
             );
             Ok(false)
@@ -225,9 +228,22 @@ async fn authenticate_by_protocol(
     }
 }
 
-async fn authenticate_http(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+async fn authenticate_http_or_https(
+    client_stream: &mut ClientStream,
+    state: &AppState,
+) -> AuthResult<bool> {
     let mut buffer = [0u8; 4096];
-    let n = client_stream.peek(&mut buffer).await?;
+
+    // Use peek equivalent for our stream type
+    let n = match client_stream {
+        ClientStream::Plain(stream) => stream.peek(&mut buffer).await?,
+        ClientStream::Tls(stream) => {
+            // For TLS streams, we need to read instead of peek
+            // Save the position and data for later re-use
+            let _pos = stream.get_ref().0.peer_addr()?; // TODO: This is a hack, need a better way
+            stream.read(&mut buffer).await?
+        }
+    };
 
     if n == 0 {
         return Err("Connection closed by client".into());
@@ -257,7 +273,7 @@ fn extract_proxy_auth_header(request_data: &str) -> Option<&str> {
 }
 
 async fn send_http_auth_required_response(
-    client_stream: &mut TcpStream,
+    client_stream: &mut ClientStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
                    Proxy-Authenticate: Basic realm=\"Proxy\"\r\n\
@@ -270,7 +286,10 @@ async fn send_http_auth_required_response(
     Ok(())
 }
 
-async fn authenticate_socks4(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+async fn authenticate_socks4(
+    client_stream: &mut ClientStream,
+    state: &AppState,
+) -> AuthResult<bool> {
     // Read SOCKS4 request
     let mut request_buf = [0u8; 8];
     client_stream.read_exact(&mut request_buf).await?;
@@ -325,7 +344,10 @@ fn validate_socks4_user_id(user_id: &str, state: &AppState) -> bool {
     }
 }
 
-async fn authenticate_socks5(client_stream: &mut TcpStream, state: &AppState) -> AuthResult<bool> {
+async fn authenticate_socks5(
+    client_stream: &mut ClientStream,
+    state: &AppState,
+) -> AuthResult<bool> {
     // Read SOCKS5 handshake
     let mut handshake_buf = [0u8; 2];
     client_stream.read_exact(&mut handshake_buf).await?;
@@ -390,13 +412,27 @@ async fn authenticate_socks5(client_stream: &mut TcpStream, state: &AppState) ->
 }
 
 async fn async_handle_client(
-    client_stream: &mut TcpStream,
+    client_stream: &mut ClientStream,
     client_addr: SocketAddr,
     protocol: &mut ProxyProtocol,
 ) -> Result<(), (io::Error, ErrorType)> {
     let mut peek_buf = [0u8; 4];
-    *protocol = match timeout(Duration::from_secs(5), client_stream.peek(&mut peek_buf)).await {
-        Ok(Ok(_)) => detect_protocol(&peek_buf)
+    let peek_result = timeout(Duration::from_secs(5), async {
+        match client_stream {
+            ClientStream::Plain(stream) => stream.peek(&mut peek_buf).await,
+            ClientStream::Tls(stream) => {
+                // For TLS streams, we need to read instead of peek
+                // Save the position and data for later re-use
+                let _pos = stream.get_ref().0.peer_addr()?; // TODO: This is a hack, need a better way
+                let n = stream.read(&mut peek_buf).await?;
+                Ok(n)
+            }
+        }
+    })
+    .await;
+
+    *protocol = match peek_result {
+        Ok(Ok(_n)) => detect_protocol(&peek_buf)
             .await
             .unwrap_or(ProxyProtocol::TCP),
         Ok(Err(_)) | Err(_) => ProxyProtocol::TCP,
@@ -518,7 +554,7 @@ async fn detect_protocol(peek_buf: &[u8; 4]) -> io::Result<ProxyProtocol> {
 }
 
 async fn parse_target_by_protocol(
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     protocol: &ProxyProtocol,
 ) -> io::Result<ProxyTarget> {
     match protocol {
@@ -530,7 +566,7 @@ async fn parse_target_by_protocol(
     }
 }
 
-async fn parse_http_target_from_stream(stream: &mut TcpStream) -> io::Result<ProxyTarget> {
+async fn parse_http_target_from_stream(stream: &mut ClientStream) -> io::Result<ProxyTarget> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
@@ -553,11 +589,20 @@ async fn parse_http_target_from_stream(stream: &mut TcpStream) -> io::Result<Pro
     }
 }
 
-async fn parse_https_target_from_stream(stream: &mut TcpStream) -> io::Result<ProxyTarget> {
+async fn parse_https_target_from_stream(stream: &mut ClientStream) -> io::Result<ProxyTarget> {
     // For HTTPS, we need to parse SNI from TLS handshake
     // This is a simplified version - you'd need full TLS parsing for production
     let mut buf = vec![0u8; 512];
-    let n = stream.peek(&mut buf).await?;
+    // Use peek equivalent for our stream type
+    let n = match stream {
+        ClientStream::Plain(stream) => stream.peek(&mut buf).await?,
+        ClientStream::Tls(stream) => {
+            // For TLS streams, we need to read instead of peek
+            // Save the position and data for later re-use
+            let _pos = stream.get_ref().0.peer_addr()?; // TODO: This is a hack, need a better way
+            stream.read(&mut buf).await?
+        }
+    };
 
     if let Some(sni) = extract_sni_from_tls(&buf[..n]) {
         Ok(ProxyTarget {
@@ -573,7 +618,7 @@ async fn parse_https_target_from_stream(stream: &mut TcpStream) -> io::Result<Pr
     }
 }
 
-async fn parse_socks4_target(stream: &mut TcpStream) -> io::Result<ProxyTarget> {
+async fn parse_socks4_target(stream: &mut ClientStream) -> io::Result<ProxyTarget> {
     let mut buf = [0u8; 8];
     stream.read_exact(&mut buf).await?;
 
@@ -613,7 +658,7 @@ async fn parse_socks4_target(stream: &mut TcpStream) -> io::Result<ProxyTarget> 
     })
 }
 
-async fn parse_socks5_target(stream: &mut TcpStream) -> io::Result<ProxyTarget> {
+async fn parse_socks5_target(stream: &mut ClientStream) -> io::Result<ProxyTarget> {
     // Handle authentication negotiation first
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await?;
@@ -734,7 +779,7 @@ fn extract_sni_from_tls(data: &[u8]) -> Option<String> {
     None
 }
 
-async fn parse_target(stream: &mut TcpStream) -> io::Result<ProxyTarget> {
+async fn parse_target(stream: &mut ClientStream) -> io::Result<ProxyTarget> {
     // Robust parsing with timeout and error handling
     let timeout = tokio::time::Duration::from_secs(5);
 

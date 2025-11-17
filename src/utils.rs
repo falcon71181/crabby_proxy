@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpStream};
 
-use crate::error::ProxyError;
+use crate::{error::ProxyError, stream::ClientStream};
 
 // write from tcp stream
 pub async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> Result<(), ProxyError> {
@@ -46,7 +46,7 @@ pub async fn read_from_stream(stream: &mut TcpStream, buf: &mut [u8]) -> Result<
 /// This is especially relevant when implementing a **man-in-the-middle proxy** or
 /// **forward proxy** for HTTPS traffic, where the client expects a valid `200 OK`
 /// after issuing a `CONNECT` request.
-pub async fn send_http_connect_response(stream: &mut TcpStream) -> tokio::io::Result<()> {
+pub async fn send_http_connect_response(stream: &mut ClientStream) -> tokio::io::Result<()> {
     stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await
 }
 
@@ -66,7 +66,10 @@ pub async fn send_http_connect_response(stream: &mut TcpStream) -> tokio::io::Re
 /// - `DSTPORT` and `DSTIP` are typically set to `0x0000` and `0.0.0.0` respectively.
 /// -  SOCKS4 response format: [VN, CD, DSTPORT (2 bytes), DSTIP (4 bytes)]
 /// -  VN is always 0x00, CD is 0x5a (success) or 0x5b (failure)
-pub async fn send_socks4_response(stream: &mut TcpStream, success: bool) -> tokio::io::Result<()> {
+pub async fn send_socks4_response(
+    stream: &mut ClientStream,
+    success: bool,
+) -> tokio::io::Result<()> {
     let response = if success {
         [0x00, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] // Success
                                                          // 0 90 0.0.0.0:00
@@ -93,7 +96,10 @@ pub async fn send_socks4_response(stream: &mut TcpStream, success: bool) -> toki
 /// - `RSV` is reserved and must be `0x00`.
 /// - `ATYP` is `0x01` for IPv4.
 /// - `BND.ADDR` and `BND.PORT` are typically `0.0.0.0:0` if unused.
-pub async fn send_socks5_response(stream: &mut TcpStream, success: bool) -> tokio::io::Result<()> {
+pub async fn send_socks5_response(
+    stream: &mut ClientStream,
+    success: bool,
+) -> tokio::io::Result<()> {
     let response = if success {
         [0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00] // Success
                                                                      // 5 0 0 1 0.0.0.0:00

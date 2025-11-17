@@ -454,7 +454,8 @@ async fn async_handle_client(
         .map_err(|e| (e, ErrorType::Connection))?;
 
     tracing::info!(
-        "Connection established to {} by {}",
+        "[{}]: Connection established to {} by {}",
+        &protocol,
         target_addr,
         client_addr
     );
@@ -477,7 +478,8 @@ async fn async_handle_client(
     match create_bidirectional_tunnel(client_halves, target_halves, &label_c2t, &label_t2c).await {
         Ok((c2t, t2c)) => {
             tracing::info!(
-                "Closed tunnel {} <-> {} (sent: {}, received: {})",
+                "[{}]: Closed tunnel {} <-> {} (sent: {}, received: {})",
+                &protocol,
                 client_addr,
                 target_addr,
                 c2t,
@@ -486,7 +488,7 @@ async fn async_handle_client(
             Ok(())
         }
         Err(e) => {
-            tracing::warn!("Tunnel error: {}", e);
+            tracing::warn!("[{}]: Tunnel error: {}", &protocol, e);
             Err((e, ErrorType::Tunnel))
         }
     }

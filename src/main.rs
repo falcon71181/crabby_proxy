@@ -24,9 +24,10 @@ async fn main() {
 
     let mut username: Option<String> = None;
     let mut password: Option<String> = None;
+    let mut port: u32 = 8080;
 
     if require_creds {
-        // Parsing --username <value> and --password <value>
+        // Parsing --username <value> and --password <value> and --proxy-port <value>
         // TODO: add and use dependency clap
         for i in 0..arguments.len() {
             match arguments[i].as_str() {
@@ -35,6 +36,9 @@ async fn main() {
                 }
                 "--password" if i + 1 < arguments.len() => {
                     password = Some(arguments[i + 1].clone());
+                }
+                "--proxy-port" if i + 1 < arguments.len() => {
+                    port = arguments[i + 1].clone().parse().unwrap();
                 }
                 _ => {}
             }
@@ -47,11 +51,12 @@ async fn main() {
     }
     let state = AppState::new(notify_tx, require_creds, username, password, None);
 
-    let proxy_handle = tokio::spawn(run_proxy_server(
-        state.clone(),
-        "0.0.0.0:8080".parse().unwrap(),
-    ));
+    let addr: String = format!("0.0.0.0:{}", &port);
+    tracing::info!("Starting Proxy Server at: {}", &addr);
 
+    let proxy_handle = tokio::spawn(run_proxy_server(state.clone(), addr.parse().unwrap()));
+
+    // TODO: make api admin flow
     // let admin_handle = tokio::spawn(run_admin_server(
     //     state.clone(),
     //     "0.0.0.0:8081".parse().unwrap(),

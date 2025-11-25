@@ -18,19 +18,19 @@ struct Args {
     #[arg(long)]
     no_creds: bool,
 
-    #[arg(long, required_unless_present = "no_creds")]
+    #[arg(short = 'u', long, required_unless_present = "no_creds")]
     username: Option<String>,
 
-    #[arg(long, required_unless_present = "no_creds")]
+    #[arg(short = 'p', long, required_unless_present = "no_creds")]
     password: Option<String>,
 
-    #[arg(long, default_value = "8080")]
+    #[arg(short = 'P', long, default_value = "8080")]
     proxy_port: u32,
 
-    #[arg(long)]
+    #[arg(short = 't', long)]
     tls_certificate: Option<String>,
 
-    #[arg(long, requires = "tls_certificate")]
+    #[arg(short = 'k', long, requires = "tls_certificate")]
     tls_private_key: Option<String>,
 }
 

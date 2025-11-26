@@ -1,5 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpStream};
+use tokio_rustls::{
+    rustls::{
+        pki_types::{CertificateDer, PrivateKeyDer},
+        ServerConfig,
+    },
+    TlsAcceptor,
+};
 
 use crate::{error::ProxyError, stream::ClientStream};
 
@@ -108,4 +117,55 @@ pub async fn send_socks5_response(
                                                                      // 5 1 0 1 0.0.0.0:00
     };
     stream.write_all(&response).await
+}
+
+pub fn create_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+
+    let config = ServerConfig::builder()
+        // .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
+    let cert_file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(cert_file);
+
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut reader).collect::<Result<_, _>>()?;
+
+    Ok(certs)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    let key_file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(key_file);
+
+    // Try PKCS8
+    if let Some(key) = rustls_pemfile::pkcs8_private_keys(&mut reader)
+        .next()
+        .transpose()?
+    {
+        return Ok(PrivateKeyDer::Pkcs8(key));
+    }
+
+    // Try RSA
+    let key_file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(key_file);
+
+    if let Some(key) = rustls_pemfile::rsa_private_keys(&mut reader)
+        .next()
+        .transpose()?
+    {
+        return Ok(PrivateKeyDer::Pkcs1(key));
+    }
+
+    Err("No usable private key found".into())
 }

@@ -9,6 +9,7 @@ mod utils;
 
 use crate::app_state::AppState;
 use crate::proxy::listener::run_proxy_server;
+use crate::utils::create_tls_acceptor;
 use clap::Parser;
 use tokio::sync::mpsc;
 
@@ -43,12 +44,19 @@ async fn main() {
 
     let args = Args::parse();
 
+    let tls_acceptor =
+        if let (Some(cert_path), Some(key_path)) = (&args.tls_certificate, &args.tls_private_key) {
+            Some(create_tls_acceptor(cert_path, key_path).unwrap())
+        } else {
+            None
+        };
+
     let state = AppState::new(
         notify_tx,
         !args.no_creds,
         args.username,
         args.password,
-        None,
+        tls_acceptor,
     );
 
     let addr: String = format!("0.0.0.0:{}", &args.proxy_port);
